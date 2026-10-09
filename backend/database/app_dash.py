@@ -1,10 +1,12 @@
+import os
+from pathlib import Path
 import pandas as pd
 from sqlalchemy import create_engine
 from dash import Dash, dash_table, html, dcc, Input, Output
 
 # ── DB Connection ──────────────────────────
 engine = create_engine(
-    "postgresql+psycopg2://snaptrade_user:testing@localhost:5432/snaptrade_db"
+    os.environ.get("DATABASE_URL", f"sqlite:///{Path(__file__).with_name('portfolio.db')}")
 )
 
 # ── Load Data ──────────────────────────────

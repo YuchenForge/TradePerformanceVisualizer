@@ -13,16 +13,17 @@ Usage:
 """
 
 import json
+import os
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 from snaptrade_client import SnapTrade
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SNAPTRADE_CLIENT_ID    = "BFI-DFTUD"
-SNAPTRADE_CONSUMER_KEY = "UflJTFaCJXSpEEmoGaEjtotESLszJnvFlXrglda7xlWRbAgb6y"
-USERS_DB_FILE          = Path("users.json")
-EXPORT_DIR             = Path("data-export")
+SNAPTRADE_CLIENT_ID = os.environ.get("SNAPTRADE_CLIENT_ID", "")
+SNAPTRADE_CONSUMER_KEY = os.environ.get("SNAPTRADE_CONSUMER_KEY", "")
+USERS_DB_FILE          = Path(os.environ.get("USERS_DB_FILE", Path(__file__).resolve().parents[1] / "users.json"))
+EXPORT_DIR             = Path(os.environ.get("ACCOUNT_DATA_DIR", Path(__file__).resolve().parents[1] / "data-export"))
 EXPORT_FILE            = EXPORT_DIR / "snaptrade_full_export.json"
 
 snaptrade = SnapTrade(
@@ -32,9 +33,9 @@ snaptrade = SnapTrade(
 
 # ── ✏️  NEW USER — fill in before running with --add ─────────────────────────
 NEW_USER = {
-    "username":              "cgschwarz0424",
-    "snaptrade_user_id":     "cgschwarz0424",   # often same as username
-    "snaptrade_user_secret": "a05ea687-dac6-4124-907b-04884753105b",
+    "username": os.environ.get("SNAPTRADE_USERNAME", ""),
+    "snaptrade_user_id": os.environ.get("SNAPTRADE_USER_ID", ""),
+    "snaptrade_user_secret": os.environ.get("SNAPTRADE_USER_SECRET", ""),
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -66,8 +67,8 @@ def safe_body(response):
 def add_user(users: dict) -> dict:
     username = NEW_USER["username"]
 
-    if username == "YOUR_USERNAME":
-        print("  ✗  Please fill in the NEW_USER block at the top of the script before using --add.")
+    if not all(NEW_USER.values()) or username == "YOUR_USERNAME":
+        print("  ✗  Set SNAPTRADE_USERNAME, SNAPTRADE_USER_ID and SNAPTRADE_USER_SECRET before using --add.")
         exit(1)
 
     if username in users:
@@ -103,7 +104,7 @@ def _fetch_all_activities(user_id: str, user_secret: str, acc_id: str) -> list:
             result = safe_body(raw_response)
         except Exception as exc:
             print(f"        ⚠  get_account_activities offset {offset} failed: {exc}")
-            break
+            raise
 
         if not result:
             break
@@ -145,7 +146,7 @@ def export_user(username: str, user_id: str, user_secret: str) -> dict:
                 return safe_body(fn(user_id=user_id, user_secret=user_secret, account_id=acc_id, **kwargs))
             except Exception as exc:
                 print(f"        ⚠  {fn.__name__} failed: {exc}")
-                return []
+                raise
 
         accounts_out.append({
             "account":    acc,
@@ -153,14 +154,7 @@ def export_user(username: str, user_id: str, user_secret: str) -> dict:
             "balances":   _fetch(snaptrade.account_information.get_user_account_balance),
             "positions":  _fetch(snaptrade.account_information.get_user_account_positions),
             "orders":     _fetch(snaptrade.account_information.get_user_account_orders),
-            # "activities": safe_body(
-            #     snaptrade.account_information.get_account_activities(
-            #         user_id=user_id,
-            #         user_secret=user_secret,
-            #         account_id=acc_id,
-            #     )
-            # ),
-"activities": _fetch_all_activities(user_id, user_secret, acc_id),
+            "activities": _fetch_all_activities(user_id, user_secret, acc_id),
         })
 
     return {
@@ -188,7 +182,9 @@ def save_exports(user_exports: list[dict]):
     export["total_users"] = len(export["users"])
     export["exported_at"] = datetime.now(timezone.utc).isoformat()
 
-    EXPORT_FILE.write_text(json.dumps(export, indent=2))
+    temporary = EXPORT_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(export, indent=2))
+    temporary.replace(EXPORT_FILE)
     print(f"\n✓  Export saved → {EXPORT_FILE}  ({len(user_exports)} user(s) updated, {export['total_users']} total)")
 
 
@@ -201,6 +197,8 @@ def main():
     parser.add_argument("--user",       help="Export a single existing username only")
     args = parser.parse_args()
 
+    if not SNAPTRADE_CLIENT_ID or not SNAPTRADE_CONSUMER_KEY:
+        raise ValueError("Set SNAPTRADE_CLIENT_ID and SNAPTRADE_CONSUMER_KEY")
     users = load_users()
 
     # -- Add new user if requested
@@ -222,15 +220,14 @@ def main():
             else:
                 print(f"✗  User '{args.user}' not found in users.json and NEW_USER block doesn't match.")
                 print(f"   Either add them to users.json or fill in the NEW_USER block at the top of this script.")
-                return
+                raise ValueError("Unknown user")
         target_users = {args.user: users[args.user]}
     else:
         # Export everyone
         target_users = users
 
     if not target_users:
-        print("No users to export.")
-        return
+        raise ValueError("No users to export")
 
     print(f"\n── Exporting {len(target_users)} user(s) ──")
     user_exports = []
@@ -239,11 +236,11 @@ def main():
         secret = user_data.get("snaptrade_user_secret")
         if not uid or not secret:
             print(f"  ⚠  Skipping '{username}': missing SnapTrade credentials")
-            continue
+            raise ValueError("Missing SnapTrade user credentials")
         try:
             user_exports.append(export_user(username, uid, secret))
         except Exception as exc:
-            print(f"  ✗  Failed to export '{username}': {exc}")
+            raise RuntimeError(f"Failed to export {username}") from exc
 
     save_exports(user_exports)
 

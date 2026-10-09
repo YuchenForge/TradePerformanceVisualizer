@@ -53,7 +53,9 @@ const Login = ({ onLogin }) => {
       const data = await apiPost('/auth/complete-setup', { username });
 
       if (data.success) {
-        alert('Account setup completed successfully! Please login.');
+        alert(data.database_synced === false
+          ? 'Brokerage connected. Database sync failed; retry from the explorer. You can still log in.'
+          : 'Account setup completed successfully! Please login.');
         setRegistrationStep('initial');
         setIsLogin(true);
         setConnectionUrl('');

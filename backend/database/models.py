@@ -30,7 +30,7 @@ class Account(db.Model):
 
     # relationships
     positions    = db.relationship("Position",    back_populates="account", cascade="all, delete-orphan")
-    transactions = db.relationship("Transaction", back_populates="account", cascade="all, delete-orphan")
+    transactions = db.relationship("Activity", back_populates="account", cascade="all, delete-orphan")
     orders       = db.relationship("Order",       back_populates="account", cascade="all, delete-orphan")
     performance  = db.relationship("Performance", back_populates="account", cascade="all, delete-orphan", uselist=False)
     holdings     = db.relationship("Holding",     back_populates="account", cascade="all, delete-orphan")
@@ -207,7 +207,3 @@ class Holding(db.Model):
 
     def __repr__(self):
         return f"<Holding {self.symbol} × {self.units}>"
-
-if __name__ == "__main__":
-    init_db()
-    print("✅ Database tables created (portfolio.db)")

@@ -369,6 +369,7 @@ function accInst(acc) {
 
 // ── main explorer ────────────────────────────────────────────────────────────────
 export default function SnapTradeExplorer() {
+  const [credentials, setCredentials] = useState(null);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -377,23 +378,39 @@ export default function SnapTradeExplorer() {
   const [selSection, setSelSection] = useState(null);
 
   const load = useCallback(async () => {
+    if (!credentials) return;
     setLoading(true); setError(null);
     try {
-      const res = await axios.get(`${API_URL}/explorer/data`, { withCredentials: true });
+      const res = await axios.get(`${API_URL}/explorer/data`, { withCredentials: true, auth: credentials });
       if (res.data?.success) setData(res.data.data);
       else setError(res.data?.error || "Failed to load export.");
     } catch (e) {
       setError(e.response?.status === 401 ? "Authentication required (HTTP Basic Auth)." : (e.response?.data?.error || e.message));
     } finally { setLoading(false); }
-  }, []);
+  }, [credentials]);
 
   useEffect(() => { load(); }, [load]);
 
   const refresh = async () => {
     setRefreshing(true);
-    try { await axios.post(`${API_URL}/explorer/refresh`, {}, { withCredentials: true }); }
-    catch (e) { /* surfaced on next load */ }
-    setTimeout(() => { setRefreshing(false); load(); }, 4000);
+    setError(null);
+    try {
+      await axios.post(`${API_URL}/explorer/refresh`, {}, { withCredentials: true, auth: credentials });
+      for (let attempt = 0; attempt < 75; attempt += 1) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        const { data: state } = await axios.get(`${API_URL}/explorer/refresh`, { withCredentials: true, auth: credentials });
+        if (state.status === 'failed') throw new Error(state.error);
+        if (state.status === 'complete') {
+          await load();
+          return;
+        }
+      }
+      throw new Error('Refresh is taking longer than expected. Reload to check the export.');
+    } catch (e) {
+      setError(e.response?.data?.error || e.message);
+    } finally {
+      setRefreshing(false);
+    }
   };
 
   // build the flat list of account "units" from users[].accounts[] + top-level accounts[]
@@ -417,7 +434,7 @@ export default function SnapTradeExplorer() {
   }, [units, selUnit]);
 
   const currentUnit = units.find((u) => u.id === selUnit) || null;
-  const sections = currentUnit ? Object.keys(currentUnit.acc) : [];
+  const sections = useMemo(() => currentUnit ? Object.keys(currentUnit.acc) : [], [currentUnit]);
 
   useEffect(() => {
     if (sections.length && selSection !== "__raw__" && !sections.includes(selSection))
@@ -428,6 +445,22 @@ export default function SnapTradeExplorer() {
     if (!currentUnit || !selSection || selSection === "__raw__") return null;
     return sectionToRows(currentUnit.acc[selSection]);
   }, [currentUnit, selSection]);
+
+  // Credentials stay in memory and are sent only to the configured API.
+  if (!credentials) return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-50">
+      <form className="bg-white rounded-xl border p-6 space-y-4 w-80" onSubmit={event => {
+        event.preventDefault();
+        const fields = new FormData(event.currentTarget);
+        setCredentials({ username: fields.get('username'), password: fields.get('password') });
+      }}>
+        <h1 className="text-lg font-semibold">Internal data explorer</h1>
+        <label className="block">Username<input name="username" autoComplete="username" required className="block border rounded p-2 w-full" /></label>
+        <label className="block">Password<input name="password" type="password" autoComplete="current-password" required className="block border rounded p-2 w-full" /></label>
+        <button className="bg-blue-600 text-white rounded px-4 py-2" type="submit">Sign in</button>
+      </form>
+    </div>
+  );
 
   // ── render states ──
   if (loading)
@@ -441,6 +474,7 @@ export default function SnapTradeExplorer() {
           <p className="text-gray-800 font-medium mb-1">Could not load data</p>
           <p className="text-sm text-gray-500 mb-4">{error}</p>
           <button onClick={load} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700">Retry</button>
+          <button onClick={() => { setCredentials(null); setData(null); setError(null); }} className="ml-3 text-sm text-blue-600">Change credentials</button>
         </div>
       </div>
     );

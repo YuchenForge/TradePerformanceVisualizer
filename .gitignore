@@ -31,3 +31,9 @@ backend/TEST_ACCOUNT.txt
 backend/data-export/*.json
 !backend/data-export/*.example.json
 data-export/*.json
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite*

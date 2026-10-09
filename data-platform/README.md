@@ -23,7 +23,8 @@ Then start this app (defaults to port **3001** via `.env`):
 
 ```bash
 cd data-platform
-npm install        # first time only
+npm ci             # first time only
+cp .env.example .env
 npm start
 ```
 
@@ -43,17 +44,19 @@ API calls to `/api/*` are proxied to `http://localhost:5001` (see `proxy` in
 ## Authentication
 
 The data this app reads is gated by **HTTP Basic Auth** on the backend
-(`/api/explorer/*` and `/api/db/*`). The browser prompts once for a shared
-username/password. There is no per-user login.
+(`/api/explorer/*` and `/api/db/*`). Enter the shared username/password in the explorer sign-in form. Credentials
+stay in memory until the page is reloaded. There is no per-user login.
 
-Set the credentials via env vars when starting the backend (defaults shown):
+Set the credentials via environment variables when starting the backend:
 
 ```bash
-EXPLORER_USER=admin EXPLORER_PASS=changeme python app.py
+EXPLORER_USER=admin EXPLORER_PASS='your-strong-password' python app.py
 ```
 
-> **Change `EXPLORER_PASS` before exposing this anywhere non-local** — these
-> endpoints serve real brokerage data for all users.
+The explorer is disabled until `EXPLORER_PASS` is set. These endpoints serve
+brokerage data for all users. Use HTTPS outside localhost.
+
+Refresh waits for the export and database import to finish and displays failures.
 
 ## Notes
 

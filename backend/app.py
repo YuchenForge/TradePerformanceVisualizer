@@ -8,6 +8,7 @@ import json
 import yfinance as yf
 import logging
 import hashlib
+from werkzeug.security import generate_password_hash, check_password_hash
 import secrets
 import re
 import glob
@@ -20,8 +21,8 @@ app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
 CORS(app, supports_credentials=True, origins=['http://localhost:3000', 'http://localhost:3001', 'http://127.0.0.1:3000', 'http://127.0.0.1:3001', 'http://18.221.160.103:5001', 'http://18.221.160.103:3000', 'http://bfi.duckdns.org'])
 
 # Configuration
-SNAPTRADE_CLIENT_ID = "BFI-DFTUD"
-SNAPTRADE_CONSUMER_KEY = "UflJTFaCJXSpEEmoGaEjtotESLszJnvFlXrglda7xlWRbAgb6y"
+SNAPTRADE_CLIENT_ID = os.environ.get("SNAPTRADE_CLIENT_ID", "")
+SNAPTRADE_CONSUMER_KEY = os.environ.get("SNAPTRADE_CONSUMER_KEY", "")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -31,12 +32,14 @@ SNAPTRADE_CONSUMER_KEY = "UflJTFaCJXSpEEmoGaEjtotESLszJnvFlXrglda7xlWRbAgb6y"
 # Override the defaults via env vars EXPLORER_USER / EXPLORER_PASS.
 # ─────────────────────────────────────────────────────────────────────────────
 EXPLORER_USER = os.environ.get('EXPLORER_USER', 'admin')
-EXPLORER_PASS = os.environ.get('EXPLORER_PASS', 'changeme')
+EXPLORER_PASS = os.environ.get('EXPLORER_PASS', '')
 
 
 def require_basic_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
+        if not EXPLORER_PASS:
+            return jsonify({'success': False, 'error': 'Set EXPLORER_PASS to enable the explorer'}), 503
         auth = request.authorization
         if not auth or auth.username != EXPLORER_USER or auth.password != EXPLORER_PASS:
             return Response(
@@ -48,13 +51,15 @@ def require_basic_auth(f):
 
 
 # Database files
-USERS_DB_FILE = 'users.json'
-ACCOUNT_DATA_DIR = 'data-export'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+USERS_DB_FILE = os.environ.get('USERS_DB_FILE', os.path.join(BASE_DIR, 'users.json'))
+ACCOUNT_DATA_DIR = os.environ.get('ACCOUNT_DATA_DIR', os.path.join(BASE_DIR, 'data-export'))
 ACCOUNT_DATA_FILE = os.path.join(ACCOUNT_DATA_DIR, 'account-data.json')
 
 DATABASE_DIR = os.path.join(os.path.dirname(__file__), 'database')
 
-from database.models import db, User, Account, Position, Order, Activity
+from database.models import db, Account, Position, Order, Activity
+from sqlalchemy import text
 from database.db_sync import sync_export_to_db
 
 # PostgreSQL: set DATABASE_URL=postgresql+psycopg://user:pass@localhost/dbname
@@ -105,8 +110,14 @@ def save_account_data(account_data):
         json.dump(account_data, f, indent=2)
 
 def hash_password(password):
-    """Hash password using SHA256"""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Use a salted password hash for newly created accounts."""
+    return generate_password_hash(password)
+
+
+def verify_password(stored, password):
+    if re.fullmatch(r'[0-9a-f]{64}', stored or ''):
+        return secrets.compare_digest(stored, hashlib.sha256(password.encode()).hexdigest())
+    return check_password_hash(stored or '', password)
 
 def get_current_user():
     """Get current logged-in user from session"""
@@ -117,6 +128,8 @@ def get_current_user():
 
 def get_snaptrade_client():
     """Get SnapTrade client with global credentials"""
+    if not SNAPTRADE_CLIENT_ID or not SNAPTRADE_CONSUMER_KEY:
+        raise RuntimeError('Set SNAPTRADE_CLIENT_ID and SNAPTRADE_CONSUMER_KEY')
     return SnapTrade(
         client_id=SNAPTRADE_CLIENT_ID,
         consumer_key=SNAPTRADE_CONSUMER_KEY
@@ -601,7 +614,11 @@ def get_portfolio_summary():
 def register():
     """Register a new user account and create Snaptrade user"""
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({'success': False, 'error': 'A JSON object is required'}), 400
+        if not isinstance(data.get('username', ''), str) or not isinstance(data.get('password', ''), str):
+            return jsonify({'success': False, 'error': 'Username and password must be strings'}), 400
         username = data.get('username', '').strip()
         password = data.get('password', '').strip()
         
@@ -662,6 +679,7 @@ def register():
             'created_at': datetime.now().isoformat()
         }
         save_users(users)
+        session['pending_setup'] = username
         
         return jsonify({
             'success': True,
@@ -678,7 +696,11 @@ def register():
 def complete_setup():
     """Complete account setup by fetching and storing account data"""
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({'success': False, 'error': 'A JSON object is required'}), 400
+        if not isinstance(data.get('username', ''), str) or not isinstance(data.get('password', ''), str):
+            return jsonify({'success': False, 'error': 'Username and password must be strings'}), 400
         username = data.get('username', '').strip()
  
         if not username:
@@ -696,6 +718,9 @@ def complete_setup():
         if not user_id or not user_secret:
             return jsonify({'success': False, 'error': 'Invalid user credentials'}), 400
  
+        if session.get('pending_setup') != username and session.get('username') != username:
+            return jsonify({'success': False, 'error': 'Not authorized to complete this account'}), 403
+
         # ── existing: fetch account list from SnapTrade ───────────────────────
         snaptrade_client = get_snaptrade_client()
         try:
@@ -739,19 +764,20 @@ def complete_setup():
         users[username]['accounts_fetched_at'] = datetime.now().isoformat()
         save_users(users)
  
-        # ── NEW: populate SQLite DB via ORM ───────────────────────────────────
-        # Runs in the same process; errors are non-fatal so setup still succeeds.
+        # Export the connected user's current data before importing it.
+        database_synced = False
         try:
-            print("[complete_setup] Syncing export to DB...")
-            stats = sync_export_to_db(verbose=True)
-            print(f"[complete_setup] DB sync complete: {stats}")
-        except Exception as db_err:
-            print(f"[complete_setup] ⚠️ DB sync failed (non-fatal): {db_err}")
-        # ─────────────────────────────────────────────────────────────────────
- 
+            subprocess.run([sys.executable, os.path.join(DATABASE_DIR, 'snaptrade_export_all.py'),
+                            '--user', username], timeout=120, check=True, cwd=BASE_DIR)
+            sync_export_to_db(export_file=os.path.join(ACCOUNT_DATA_DIR, "snaptrade_full_export.json"))
+            database_synced = True
+        except Exception:
+            app.logger.exception("Account connected, but database sync failed")
+
         return jsonify({
             'success': True,
             'message': 'Account setup completed successfully',
+            'database_synced': database_synced,
             'accounts': accounts
         })
  
@@ -763,7 +789,11 @@ def complete_setup():
 def login():
     """Login user"""
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({'success': False, 'error': 'A JSON object is required'}), 400
+        if not isinstance(data.get('username', ''), str) or not isinstance(data.get('password', ''), str):
+            return jsonify({'success': False, 'error': 'Username and password must be strings'}), 400
         username = data.get('username', '').strip()
         password = data.get('password', '').strip()
         
@@ -773,7 +803,7 @@ def login():
         users = load_users()
         user = users.get(username)
         
-        if not user or user['password_hash'] != hash_password(password):
+        if not user or not verify_password(user.get('password_hash'), password):
             return jsonify({'success': False, 'error': 'Invalid username or password'}), 401
         
         # Check if account is connected
@@ -784,6 +814,10 @@ def login():
                 'needs_setup': True
             }), 403
         
+        if re.fullmatch(r'[0-9a-f]{64}', user.get('password_hash', '')):
+            user['password_hash'] = hash_password(password)
+            save_users(users)
+        session.clear()
         session['username'] = username
         return jsonify({
             'success': True,
@@ -796,7 +830,7 @@ def login():
 @app.route('/api/auth/logout', methods=['POST'])
 def logout():
     """Logout user"""
-    session.pop('username', None)
+    session.clear()
     return jsonify({'success': True, 'message': 'Logged out successfully'})
 
 @app.route('/api/auth/status', methods=['GET'])
@@ -1609,7 +1643,8 @@ def _mock_quote(symbol: str):
         'name': symbol,
         'price': price,
         'changePercent': round(jitter, 2),
-        'updated': datetime.now().isoformat()
+        'updated': datetime.now().isoformat(),
+        'source': 'demo'
     }
 
 
@@ -1654,9 +1689,16 @@ def index():
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
+    """Check database connectivity as well as the HTTP service."""
+    try:
+        db.session.execute(text("SELECT 1"))
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("Database health check failed")
+        return jsonify({'status': 'unhealthy', 'database': 'unavailable'}), 503
     return jsonify({
         'status': 'healthy',
+        'database': 'connected',
         'timestamp': datetime.now().isoformat()
     })
 
@@ -1683,22 +1725,34 @@ def explorer_get_data():
 # POST /api/explorer/refresh
 # Kicks off snaptrade_export_all.py in a background thread.
 # ─────────────────────────────────────────────────────────────────────────────
-@app.route("/api/explorer/refresh", methods=["POST"])
+_refresh_lock = threading.Lock()
+_refresh_state = {"status": "idle", "error": None}
+
+
+@app.route("/api/explorer/refresh", methods=["GET", "POST"])
 @require_basic_auth
 def explorer_refresh():
+    if request.method == "GET":
+        return jsonify({"success": True, **_refresh_state})
+    if not _refresh_lock.acquire(blocking=False):
+        return jsonify({"success": False, "error": "Refresh already running"}), 409
+    _refresh_state.update(status="running", error=None)
+
     def _run():
         try:
             export_script = os.path.join(DATABASE_DIR, 'snaptrade_export_all.py')
-            subprocess.run([sys.executable, export_script], timeout=120, check=True, cwd=os.path.dirname(__file__))
-            print("[explorer] Export done, syncing to DB...")
+            subprocess.run([sys.executable, export_script], timeout=120, check=True, cwd=BASE_DIR)
             with app.app_context():
-                sync_export_to_db(verbose=True)
-            print("[explorer] DB sync complete.")
-        except Exception as exc:
-            print(f"[explorer] Refresh/sync failed: {exc}")
+                sync_export_to_db(export_file=os.path.join(ACCOUNT_DATA_DIR, "snaptrade_full_export.json"))
+            _refresh_state.update(status="complete", error=None)
+        except Exception:
+            app.logger.exception("Explorer refresh failed")
+            _refresh_state.update(status="failed", error="Export or database sync failed; check backend logs.")
+        finally:
+            _refresh_lock.release()
 
     threading.Thread(target=_run, daemon=True).start()
-    return jsonify({"success": True, "message": "Export + DB sync started in background."})
+    return jsonify({"success": True, "status": "running"}), 202
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GET /api/explorer/meta
@@ -1729,90 +1783,71 @@ def explorer_meta():
     })
 # ── PostgreSQL table endpoints ─────────────────────────────────────────────
 
-def _require_db_user():
-    user = get_current_user()
-    if not user:
-        return None, (jsonify({"success": False, "error": "Not authenticated"}), 401)
-    return user, None
-
-
 @app.route("/api/db/positions", methods=["GET"])
 @require_basic_auth
 def db_positions():
-    _, err = _require_db_user()
-    if err:
-        return err
     rows = (
-        db.session.query(Position, Account, User)
+        db.session.query(Position, Account)
         .join(Account, Position.account_id == Account.id)
-        .join(User, Account.user_id == User.id)
         .all()
     )
     return jsonify({"success": True, "data": [
         {
-            "username": u.username,
+            "username": a.username,
             "account": a.name,
             "symbol": p.symbol,
             "description": p.description,
             "exchange": p.exchange,
             "asset_type": p.asset_type,
-            "quantity": p.quantity,
+            "quantity": p.units,
             "price": p.price,
-            "avg_cost": p.avg_cost,
+            "avg_cost": p.average_purchase_price,
             "market_value": p.market_value,
             "open_pnl": p.open_pnl,
         }
-        for p, a, u in rows
+        for p, a in rows
     ]})
 
 @app.route("/api/db/orders", methods=["GET"])
 @require_basic_auth
 def db_orders():
-    _, err = _require_db_user()
-    if err:
-        return err
     rows = (
-        db.session.query(Order, Account, User)
+        db.session.query(Order, Account)
         .join(Account, Order.account_id == Account.id)
-        .join(User, Account.user_id == User.id)
         .all()
     )
     return jsonify({"success": True, "data": [
         {
-            "username": u.username,
+            "username": a.username,
             "account": a.name,
-            "symbol": o.symbol,
-            "side": o.side,
+            "symbol": o.underlying_symbol,
+            "side": o.action,
             "order_type": o.order_type,
-            "quantity": o.quantity,
+            "quantity": o.total_quantity,
             "filled_quantity": o.filled_quantity,
-            "price": o.price,
+            "price": o.execution_price,
             "status": o.status,
             "time_in_force": o.time_in_force,
-            "created_at": o.created_at.isoformat() if o.created_at else None,
-            "filled_at": o.filled_at.isoformat() if o.filled_at else None,
+            "created_at": o.time_placed.isoformat() if o.time_placed else None,
+            "filled_at": o.time_executed.isoformat() if o.time_executed else None,
         }
-        for o, a, u in rows
+        for o, a in rows
     ]})
 
 @app.route("/api/db/activities", methods=["GET"])
 @require_basic_auth
 def db_activities():
-    _, err = _require_db_user()
-    if err:
-        return err
     rows = (
-        db.session.query(Activity, Account, User)
+        db.session.query(Activity, Account)
         .join(Account, Activity.account_id == Account.id)
-        .join(User, Account.user_id == User.id)
         .all()
     )
     return jsonify({"success": True, "data": [
         {
-            "username": u.username,
+            "username": a.username,
             "account": a.name,
             "trade_date": act.trade_date.isoformat() if act.trade_date else None,
-            "type": act.activity_type,
+            "type": act.type,
             "symbol": act.symbol,
             "description": act.description,
             "amount": act.amount,
@@ -1820,27 +1855,23 @@ def db_activities():
             "price": act.price,
             "fee": act.fee,
         }
-        for act, a, u in rows
+        for act, a in rows
     ]})
 
 @app.route("/api/db/accounts", methods=["GET"])
 @require_basic_auth
 def db_accounts():
-    _, err = _require_db_user()
-    if err:
-        return err
     rows = (
-        db.session.query(Account, User)
-        .join(User, Account.user_id == User.id)
+        db.session.query(Account)
         .all()
     )
     return jsonify({"success": True, "data": [
         {
-            "username": u.username,
-            "account_id": a.account_id,
+            "username": a.username,
+            "account_id": a.id,
             "name": a.name,
             "number": a.number,
-            "institution": a.institution,
+            "institution": a.institution_name,
             "type": a.account_type,
             "status": a.status,
             "is_paper": a.is_paper,
@@ -1848,23 +1879,20 @@ def db_accounts():
             "cash": a.cash,
             "buying_power": a.buying_power,
         }
-        for a, u in rows
+        for a in rows
     ]})
 
 @app.route("/api/db/sync", methods=["POST"])
 @require_basic_auth
 def db_sync_endpoint():
     """Manually trigger a DB sync from the existing JSON export."""
-    _, err = _require_db_user()
-    if err:
-        return err
     try:
-        stats = sync_export_to_db(verbose=True)
+        stats = sync_export_to_db(export_file=os.path.join(ACCOUNT_DATA_DIR, "snaptrade_full_export.json"), verbose=True)
         return jsonify({"success": True, "stats": stats})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
         
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    app.run(debug=os.environ.get('FLASK_DEBUG') == '1', port=5001)
 
 

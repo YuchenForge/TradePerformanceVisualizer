@@ -1,16 +1,21 @@
+"""Transactional SnapTrade snapshot importer shared by the API and CLI."""
 import json
-import pandas as pd
-from datetime import datetime
-from sqlalchemy import create_engine, text
-import uuid
 import os
+import sys
+import uuid
+from datetime import datetime
+from pathlib import Path
 
-# ── Config ────────────────────────────────
-DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql+psycopg2://snaptrade_user:testing@localhost:5432/snaptrade_db"
-)
-EXPORT_FILE = "data-export/snaptrade_full_export.json"
+from flask import has_app_context
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from database.models import db, Account, Position, Order, Activity
+
+EXPORT_FILE = os.path.join(os.environ.get("ACCOUNT_DATA_DIR", os.path.join(os.path.dirname(os.path.dirname(__file__)), "data-export")), "snaptrade_full_export.json")
 
 
 # ── Helpers ───────────────────────────────
@@ -19,7 +24,7 @@ def parse_dt(val):
         return None
     try:
         return datetime.fromisoformat(str(val).replace("Z", "+00:00"))
-    except:
+    except (ValueError, TypeError, AttributeError):
         return None
 
 def safe_dict(x):
@@ -32,7 +37,7 @@ def is_uuid(val):
     try:
         uuid.UUID(str(val))
         return True
-    except:
+    except (ValueError, TypeError, AttributeError):
         return False
 
 def extract_symbol(obj):
@@ -52,28 +57,45 @@ def extract_symbol(obj):
                 return val
     return None
 
-def ensure_uuid(series):
-    return series.apply(lambda x: x if pd.notnull(x) and str(x).strip() != "" else str(uuid.uuid4()))
+def sync_export_to_db(export_file=None, db_url=None, verbose=False):
+    """Import account snapshots atomically into the application's database.
 
-
-# ── Main callable ─────────────────────────
-def sync_export_to_db(export_file: str = EXPORT_FILE, db_url: str = DB_URL, verbose: bool = False) -> dict:
+    Accounts absent from an export are preserved. Invalid snapshots roll back.
+    An explicit db_url is supported for maintenance and isolated tests.
     """
-    Parse snaptrade_full_export.json and upsert into PostgreSQL.
-    Returns a stats dict: {accounts, positions, orders, transactions}.
-    """
-    if not os.path.exists(export_file):
-        raise FileNotFoundError(f"Export file not found: {export_file}")
-
+    export_file = export_file or EXPORT_FILE
     with open(export_file) as f:
         data = json.load(f)
+    if not isinstance(data, dict) or not ({"users", "accounts"} & data.keys()):
+        raise ValueError("Export must contain users or accounts")
+    wrappers = []
+    users = data.get("users", [])
+    if "accounts" in data:
+        users = [*users, {"username": data.get("username", "default_user"), "accounts": data["accounts"]}]
+    seen = set()
+    for user in users:
+        username = user.get("username")
+        if not username or not isinstance(user.get("accounts"), list):
+            raise ValueError("Each exported user requires a username and accounts list")
+        for wrapper in user["accounts"]:
+            account_id = safe_dict(wrapper.get("account")).get("id")
+            if not account_id or account_id in seen:
+                raise ValueError("Account IDs must be present and unique")
+            seen.add(account_id)
+            for field in ("positions", "orders", "activities"):
+                value = wrapper.get(field)
+                if field == "activities" and isinstance(value, dict):
+                    value = value.get("data")
+                if not isinstance(value, list):
+                    raise ValueError(f"Account {account_id}: {field} must be a successful list response")
+            wrappers.append((username, wrapper))
 
     accounts_rows = []
     positions_rows = []
     orders_rows = []
     transactions_rows = []
 
-    for acc_wrapper in data.get("accounts", []):
+    for username, acc_wrapper in wrappers:
         account = safe_dict(acc_wrapper.get("account"))
         balances_list = acc_wrapper.get("balances") or [{}]
         balances = balances_list[0] if isinstance(balances_list, list) else balances_list
@@ -84,7 +106,7 @@ def sync_export_to_db(export_file: str = EXPORT_FILE, db_url: str = DB_URL, verb
         # ── Accounts ──────────────────────────
         accounts_rows.append({
             "id": account_id,
-            "username": "default_user",
+            "username": username,
             "name": account.get("name"),
             "number": account.get("number"),
             "institution_name": account.get("institution_name"),
@@ -109,32 +131,32 @@ def sync_export_to_db(export_file: str = EXPORT_FILE, db_url: str = DB_URL, verb
             if not symbol:
                 continue
 
-            units = pos.get("units") or 0
-            price = pos.get("price") or 0
-            avg = pos.get("average_purchase_price") or 0
+            units = float(pos.get("units") or 0)
+            price = float(pos.get("price") or 0)
+            avg = float(pos.get("average_purchase_price") or 0)
 
             positions_rows.append({
                 "account_id": account_id,
                 "symbol": symbol,
-                "description": safe_dict(pos.get("symbol")).get("description"),
+                "description": safe_dict(safe_dict(pos.get("symbol")).get("symbol")).get("description") or safe_dict(pos.get("symbol")).get("description"),
                 "units": units,
                 "price": price,
                 "average_purchase_price": avg,
                 "open_pnl": pos.get("open_pnl"),
                 "market_value": units * price,
                 "cost_basis": units * avg,
-                "is_cash_equivalent": False,
+                "is_cash_equivalent": bool(pos.get("cash_equivalent")),
             })
 
         # ── Transactions ──────────────────────
         activities = acc_wrapper.get("activities", {})
 
-        for txn in (activities.get("data", []) if isinstance(activities, dict) else []):
+        for txn in (activities.get("data", []) if isinstance(activities, dict) else activities):
             sym_obj = txn.get("symbol") or {}
-            symbol = (sym_obj.get("symbol") or sym_obj.get("raw_symbol")) if isinstance(sym_obj, dict) else None
+            symbol = extract_symbol(sym_obj)
 
             transactions_rows.append({
-                "id":              txn.get("id"),
+                "id":              txn.get("id") or str(uuid.uuid5(uuid.NAMESPACE_URL, account_id + json.dumps(txn, sort_keys=True))),
                 "account_id":      account_id,
                 "symbol":          symbol,
                 "type":            txn.get("type"),
@@ -142,7 +164,7 @@ def sync_export_to_db(export_file: str = EXPORT_FILE, db_url: str = DB_URL, verb
                 "description":     txn.get("description"),
                 "amount":          txn.get("amount"),
                 "price":           txn.get("price"),
-                "units":           abs(txn.get("units") or 0),
+                "units":           txn.get("units") or 0,
                 "fee":             txn.get("fee"),
                 "currency":        safe_dict(txn.get("currency")).get("code"),
                 "trade_date":      parse_dt(txn.get("trade_date")),
@@ -154,18 +176,15 @@ def sync_export_to_db(export_file: str = EXPORT_FILE, db_url: str = DB_URL, verb
         for order in acc_wrapper.get("orders", []):
             order_id = order.get("brokerage_order_id") or order.get("id")
 
-            uni = order.get("universal_symbol") or {}
-            if isinstance(uni, dict):
-                underlying_symbol = uni.get("symbol") or uni.get("raw_symbol")
-            else:
-                underlying_symbol = extract_symbol(order.get("symbol"))
+            underlying_symbol = extract_symbol(order.get("universal_symbol")) or extract_symbol(order.get("symbol"))
 
             orders_rows.append({
-                "id":                 order_id,
+                "id":                 order_id or str(uuid.uuid5(uuid.NAMESPACE_URL, account_id + json.dumps(order, sort_keys=True))),
                 "account_id":         account_id,
                 "status":             order.get("status"),
                 "action":             order.get("action"),
                 "order_type":         order.get("order_type"),
+                "time_in_force":      order.get("time_in_force"),
                 "underlying_symbol":  underlying_symbol,
                 "total_quantity":     float(order.get("total_quantity") or 0),
                 "filled_quantity":    float(order.get("filled_quantity") or 0),
@@ -174,51 +193,33 @@ def sync_export_to_db(export_file: str = EXPORT_FILE, db_url: str = DB_URL, verb
                 "time_executed":      parse_dt(order.get("time_executed")),
             })
 
-    # ── Convert to DataFrames ─────────────────
-    df_accounts     = pd.DataFrame(accounts_rows)
-    df_positions    = pd.DataFrame(positions_rows)
-    df_orders       = pd.DataFrame(orders_rows)
-    df_transactions = pd.DataFrame(transactions_rows)
-
-    # ── Ensure IDs exist ──────────────────────
-    if not df_orders.empty:
-        df_orders["id"] = ensure_uuid(df_orders["id"]).astype(str)
-
-    if not df_transactions.empty:
-        df_transactions["id"] = ensure_uuid(df_transactions["id"]).astype(str)
-
-    # ── Write to DB ───────────────────────────
-    engine = create_engine(db_url)
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM transactions;"))
-        conn.execute(text("DELETE FROM orders;"))
-        conn.execute(text("DELETE FROM positions;"))
-        conn.execute(text("DELETE FROM accounts;"))
-
-        if not df_accounts.empty:
-            df_accounts.to_sql("accounts", engine, if_exists="append", index=False)
-        if not df_positions.empty:
-            df_positions.to_sql("positions", engine, if_exists="append", index=False)
-        if not df_orders.empty:
-            df_orders.to_sql("orders", engine, if_exists="append", index=False)
-        if not df_transactions.empty:
-            df_transactions.to_sql("transactions", engine, if_exists="append", index=False)
-
-    stats = {
-        "accounts":     len(df_accounts),
-        "positions":    len(df_positions),
-        "orders":       len(df_orders),
-        "transactions": len(df_transactions),
-    }
-
+    owned_engine = create_engine(db_url) if db_url else None
+    if owned_engine is None and not has_app_context():
+        raise RuntimeError("Use an app context or pass db_url explicitly")
+    engine = owned_engine if owned_engine is not None else db.engine
+    try:
+        with Session(engine) as session, session.begin():
+            for row in accounts_rows:
+                existing = session.get(Account, row["id"])
+                if existing is not None and existing.username != row["username"]:
+                    raise ValueError("Account ownership cannot change during sync")
+                session.merge(Account(**row))
+            session.flush()
+            for model, rows in ((Position, positions_rows), (Order, orders_rows), (Activity, transactions_rows)):
+                for account_id in seen:
+                    session.query(model).filter_by(account_id=account_id).delete(synchronize_session=False)
+                session.add_all(model(**row) for row in rows)
+    finally:
+        if owned_engine is not None:
+            owned_engine.dispose()
+    stats = dict(accounts=len(accounts_rows), positions=len(positions_rows),
+                 orders=len(orders_rows), transactions=len(transactions_rows))
     if verbose:
-        print(f"✅ DB sync complete!")
-        for k, v in stats.items():
-            print(f"  {k.capitalize()}: {v}")
-
+        print(f"DB sync complete: {stats}")
     return stats
 
 
-# ── Allow running as a standalone script too ──
 if __name__ == "__main__":
-    sync_export_to_db(verbose=True)
+    from app import app
+    with app.app_context():
+        sync_export_to_db(verbose=True)

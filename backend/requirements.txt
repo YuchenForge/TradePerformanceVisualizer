@@ -4,3 +4,6 @@ Flask-SQLAlchemy==3.1.1
 snaptrade-python-sdk==11.0.143
 requests==2.31.0
 yfinance==0.2.43
+
+# PostgreSQL support for DATABASE_URL=postgresql+psycopg://...
+psycopg[binary]>=3.2,<4

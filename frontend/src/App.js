@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Search, Menu, Bell, Moon, LogOut, ChevronDown, User } from 'lucide-react';
 import { apiGet, apiPost } from './api';
 import { mapHistorySeries } from './utils/chart';
@@ -65,9 +65,8 @@ const PortfolioDashboard = () => {
   useEffect(() => {
     if (isAuthenticated) {
       const initFetch = async () => {
-        await Promise.all([fetchPortfolioData(), fetchTransactions(), fetchWatchlist()]);
+        await Promise.all([fetchPortfolioData(), fetchTransactions()]);
         await fetchPortfolioStocks();
-        await fetchPortfolioHistory();
       };
       initFetch();
     }
@@ -158,7 +157,7 @@ const PortfolioDashboard = () => {
     }
   };
 
-  const fetchPortfolioHistory = async () => {
+  const fetchPortfolioHistory = useCallback(async () => {
     try {
       const symbols = selectedStocks.size > 0 && selectedStocks.size < availableStocks.length
         ? Array.from(selectedStocks).join(',')
@@ -172,9 +171,9 @@ const PortfolioDashboard = () => {
     } catch (err) {
       console.error('Error fetching portfolio history:', err);
     }
-  };
+  }, [selectedStocks, availableStocks.length, timeframe]);
 
-  const fetchBenchmarkData = async (symbol) => {
+  const fetchBenchmarkData = useCallback(async (symbol) => {
     if (!symbol || symbol === 'none') { setBenchmarkData([]); return; }
     try {
       const data = await apiGet('/benchmark/history', {
@@ -187,16 +186,17 @@ const PortfolioDashboard = () => {
       console.error('Error fetching benchmark data:', err);
       setBenchmarkData([]);
     }
-  };
+  }, [timeframe]);
 
   useEffect(() => {
+    if (!isAuthenticated) return;
     fetchPortfolioHistory();
     if (benchmark !== 'none') {
       fetchBenchmarkData(benchmark);
     } else {
       setBenchmarkData([]);
     }
-  }, [timeframe, benchmark, selectedStocks]);
+  }, [isAuthenticated, benchmark, fetchPortfolioHistory, fetchBenchmarkData]);
 
   const fetchTransactions = async () => {
     try {
@@ -204,17 +204,6 @@ const PortfolioDashboard = () => {
       if (data.success) setTransactions(data.data);
     } catch (err) {
       console.error('Error fetching transactions:', err);
-    }
-  };
-
-  const fetchWatchlist = async () => {
-    try {
-      const data = await apiGet('/watchlist');
-      if (data.success) {
-        await fetchWatchlistQuotes(data.data || []);
-      }
-    } catch (err) {
-      console.error('Error fetching watchlist:', err);
     }
   };
 
@@ -232,6 +221,22 @@ const PortfolioDashboard = () => {
       console.error('Error fetching quotes:', err);
     }
   };
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const fetchWatchlist = async () => {
+      try {
+        const data = await apiGet('/watchlist');
+        if (data.success) {
+          await fetchWatchlistQuotes(data.data || []);
+        }
+      } catch (err) {
+        console.error('Error fetching watchlist:', err);
+      }
+    };
+
+    fetchWatchlist();
+  }, [isAuthenticated]);
 
   useEffect(() => {
     if (!watchlistQuotes.length) return;
@@ -460,6 +465,7 @@ const PortfolioDashboard = () => {
           <section className="bg-white rounded-xl shadow-sm mb-6 overflow-hidden">
             <div className="flex items-center justify-between px-4 pt-3">
               <h3 className="text-sm font-semibold text-gray-700">Watchlist</h3>
+              <span className="text-xs text-gray-500">Demo prices</span>
             </div>
             <div className="relative w-full h-[84px]">
               <div className="absolute inset-0 flex transition-transform duration-500 ease-out"
